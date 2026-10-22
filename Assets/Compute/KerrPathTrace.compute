@@ -1,0 +1,612 @@
+// KerrTracer.compute
+// Translated & simplified from user's Shadertoy code (combined.c).
+// Inputs:
+//   RWTexture2D<float4> Result      - output target (width x height).
+//   Texture2D<float4> _SkyTex      - equirectangular sky texture (RGBA).
+//   SamplerState samplerLinear
+//   float3 _CamPos                 - camera position (world space)
+//   float3 _CamForward             - camera forward (normalized)
+//   float _FOV                     - vertical FOV in degrees
+//   int2 _Resolution               - render target size (x=width, y=height)
+//   int _Frame                     - frame index (optional, for noise if
+//   desired)
+// Public Kerr params exposed as floats (can be tweaked from C#):
+//   float _a, _m, _Q
+// Notes:
+// - Many functions are direct translations from GLSL -> HLSL.
+// - For sky sampling we assume equirectangular mapping (lon/lat).
+// - Some micro-optimizations (like inverse_sym) kept (translated).
+// - This shader uses 1 sample per pixel (SPP=1). You can add accumulation on
+// CPU or via ping-pong if desired.
+#pragma kernel CSMainKernel
+#include "noise.hlsl"
+
+RWTexture2D<float4> _Result;
+Texture2D<float4> _SkyTex;
+
+uint _width;
+uint _height;
+int _Frame;
+float _Time;
+
+float3 _CamPos;
+
+// View Frustrum Parameters
+float3 _topLeftDir;
+float3 _topRightDir;
+float3 _bottomLeftDir;
+float3 _bottomRightDir;
+
+// Kerr parameters
+float _a = 0.998;
+float _m = 1.0;
+float _Q = 0.0;
+float _r_isco;
+float _peak_flux;
+float _peak_flux_r;
+float _Tpeak;
+
+float _turbulenceStrength;
+float _disk_str_azimuth;
+float _disk_str_radial;
+float4 _shift;
+float _rot_speed;
+float _gain;
+float _disk_max_radius;
+
+groupshared float dt[64];
+
+// constants
+static const float PI = 3.14159265359;
+static const float TWO_PI = 6.28318530718;
+static const float cdist = 120.0;
+static const int MAX_STEPS = 128;
+static const float eps = 0.005;
+
+// ----- small math helpers -----
+float sqr(float x) { return x * x; }
+
+float3 cross3(float3 a, float3 b) { return cross(a, b); } // HLSL built-in cross
+float dot3(float3 a, float3 b) { return dot(a, b); }
+
+float3 normalize3(float3 v) { return normalize(v); }
+
+float3x3 mat3(float3 a, float3 b, float3 c) {
+  float3x3 m;
+  m[0] = a;
+  m[1] = b;
+  m[2] = c;
+  return m;
+}
+
+float3 f3(float x) { return float3(x, x, x); }
+
+float4 f4(float x) { return float4(x, x, x, x); }
+
+float3 XYZToLinearSRGB(float3 xyz) {
+  // D65 white point
+  // this is row major
+  float3x3 XYZ_TO_REC709_MAT =
+      float3x3(3.2404542, -1.5371385, -0.4985314, -0.9692660, 1.8760108,
+               0.0415560, 0.0556434, -0.2040259, 1.0572252);
+
+  return mul(XYZ_TO_REC709_MAT, xyz);
+}
+
+float ptFlux(float r) {
+  float x = sqrt(r);
+
+  float x0 = sqrt(_r_isco);
+  float x1 = 2.0 * cos((acos(_a) - PI) / 3.0);
+  float x2 = 2.0 * cos((acos(_a) + PI) / 3.0);
+  float x3 = -2.0 * cos(acos(_a) / 3.0);
+
+  float Q = 1.0 - x0 / x
+
+            - (3.0 * _a / (2.0 * x)) * log(x / x0)
+
+            - 3.0 * (x1 - _a) * (x1 - _a) / (x * x1 * (x1 - x2) * (x1 - x3)) *
+                  log((x - x1) / (x0 - x1))
+
+            - 3.0 * (x2 - _a) * (x2 - _a) / (x * x2 * (x2 - x1) * (x2 - x3)) *
+                  log((x - x2) / (x0 - x2))
+
+            - 3.0 * (x3 - _a) * (x3 - _a) / (x * x3 * (x3 - x1) * (x3 - x2)) *
+                  log((x - x3) / (x0 - x3));
+
+  return Q / (r * r * r);
+}
+
+float omegaK(float r) { return 1.0 / (r * sqrt(r) + _a); }
+
+float utKep(float r) {
+  return (1.0 + _a / (r * sqrt(r))) /
+         sqrt(max(1.0 - 3.0 / r + 2.0 * _a / (r * sqrt(r)), 1e-4));
+}
+
+float redshiftKerr(float r, float lambda) { // lambda = Lz/E of the ray
+  float g = 1.0 / (utKep(r) * (1.0 - omegaK(r) * lambda));
+  return clamp(g, 1e-3, 1e3);
+}
+
+// Linear sRGB chroma of a blackbody at temperature T. Normalized to max = 1.
+float3 blackbodyChroma(float T) {
+  T = clamp(T, 1000.0, 40000.0);
+
+  // Krystek 1985: Planckian locus in CIE 1960 (u,v)
+  float u = (0.860117757 + 1.54118254e-4 * T + 1.28641212e-7 * T * T) /
+            (1.0 + 8.42420235e-4 * T + 7.08145163e-7 * T * T);
+  float v = (0.317398726 + 4.22806245e-5 * T + 4.20481691e-8 * T * T) /
+            (1.0 - 2.89741816e-5 * T + 1.61456053e-7 * T * T);
+
+  // (u,v) -> (x,y) -> XYZ (Y = 1)
+  float d = 2.0 * u - 8.0 * v + 4.0;
+  float x = 3.0 * u / d;
+  float y = 2.0 * v / d;
+  float3 XYZ = float3(x / y, 1.0, (1.0 - x - y) / y);
+
+  float3 rgb = XYZToLinearSRGB(XYZ);
+
+  rgb = max(rgb, f3(0.0));
+  return rgb / max(max(rgb.r, rgb.g), rgb.b);
+}
+
+#define NUM_OCTAVES 4
+
+float turbulence(float r, float phi, float g, float time) {
+  float omega = omegaK(r);
+  float phi_c = phi - omega * time; // comoving azimuth
+  float3 p = float3(cos(phi_c), sin(phi_c), 0.0) * r;
+  p.z = log(r) * 4.0; // log-r: feature scale ~const
+  return fbm(p * 1.5, NUM_OCTAVES);
+}
+
+float diskTurbulence2(float r, float2 pos, float time) {
+  float omega = omegaK(r);
+  float logR = log(r);
+  float materialPhi = -omega * time * _rot_speed;
+
+  float noise = fbm_disk_gas(pos, r, logR, _disk_str_azimuth, _disk_str_radial,
+                             materialPhi); // fbm_tile(p, 5, 2.0 * PI * r);
+
+  return saturate(noise);
+}
+
+float3 calculateViewDir(float2 texCoord) {
+  float3 top = lerp(_topLeftDir, _topRightDir, texCoord.x);
+  float3 bottom = lerp(_bottomLeftDir, _bottomRightDir, texCoord.x);
+  float3 worldPos = lerp(bottom, top, texCoord.y);
+  return normalize(worldPos - _CamPos);
+}
+
+// Convert direction vector to equirectangular UV (u,v in [0,1])
+float2 SampleEquirectUV(float3 dir) {
+  // dir assumed normalized
+  float u = 0.5 + atan2(-dir.z, dir.x) / TWO_PI;
+  float v = 0.5 - asin(clamp(-dir.y, -1.0, 1.0)) / PI;
+  return float2(u, v);
+}
+
+float4 SampleSkyBilinear(float2 uv) {
+  uint w, h;
+  _SkyTex.GetDimensions(w, h);
+
+  // Wrap U, clamp V
+  float u = uv.x - floor(uv.x);
+  float v = saturate(uv.y);
+
+  float x = u * (w - 1);
+  float y = v * (h - 1);
+
+  int2 p00 = int2(floor(x), floor(y));
+  int2 p10 = int2(min(p00.x + 1, (int)w - 1), p00.y);
+  int2 p01 = int2(p00.x, min(p00.y + 1, (int)h - 1));
+  int2 p11 = int2(p10.x, p01.y);
+
+  float2 f = float2(frac(x), frac(y));
+
+  float4 c00 = _SkyTex.Load(int3(p00, 0));
+  float4 c10 = _SkyTex.Load(int3(p10, 0));
+  float4 c01 = _SkyTex.Load(int3(p01, 0));
+  float4 c11 = _SkyTex.Load(int3(p11, 0));
+
+  float4 cx0 = lerp(c00, c10, f.x);
+  float4 cx1 = lerp(c01, c11, f.x);
+  return lerp(cx0, cx1, f.y);
+}
+
+float4 SampleSky(float3 dir) {
+  float2 uv = SampleEquirectUV(dir);
+  return SampleSkyBilinear(uv);
+}
+
+// ----- matrix helpers -----
+// diag of float4 -> float4x4
+float4x4 diag(float4 a) {
+  float4x4 m;
+  m[0] = float4(a.x, 0, 0, 0);
+  m[1] = float4(0, a.y, 0, 0);
+  m[2] = float4(0, 0, a.z, 0);
+  m[3] = float4(0, 0, 0, a.w);
+  return m;
+}
+
+// inverse of symmetric 4x4 matrix
+float4x4 inverse_sym(float4x4 m) {
+  // HLSL matrices are column-major by default, but indexing m[row][col] also
+  // works.
+  float n11 = m[0][0], n12 = m[1][0], n13 = m[2][0], n14 = m[3][0];
+  float n22 = m[1][1], n23 = m[2][1], n24 = m[3][1];
+  float n33 = m[2][2], n34 = m[3][2];
+  float n44 = m[3][3];
+
+  float t11 = 2.0 * n23 * n34 * n24 - n24 * n33 * n24 - n22 * n34 * n34 -
+              n23 * n23 * n44 + n22 * n33 * n44;
+  float t12 = n14 * n33 * n24 - n13 * n34 * n24 - n14 * n23 * n34 +
+              n12 * n34 * n34 + n13 * n23 * n44 - n12 * n33 * n44;
+  float t13 = n13 * n24 * n24 - n14 * n23 * n24 + n14 * n22 * n34 -
+              n12 * n24 * n34 - n13 * n22 * n44 + n12 * n23 * n44;
+  float t14 = n14 * n23 * n23 - n13 * n24 * n23 - n14 * n22 * n33 +
+              n12 * n24 * n33 + n13 * n22 * n34 - n12 * n23 * n34;
+
+  float det = n11 * t11 + n12 * t12 + n13 * t13 + n14 * t14;
+  float idet = 1.0f / det;
+
+  float4x4 ret;
+
+  ret[0][0] = t11 * idet;
+  ret[0][1] = (n24 * n33 * n14 - n23 * n34 * n14 - n24 * n13 * n34 +
+               n12 * n34 * n34 + n23 * n13 * n44 - n12 * n33 * n44) *
+              idet;
+  ret[0][2] = (n22 * n34 * n14 - n24 * n23 * n14 + n24 * n13 * n24 -
+               n12 * n34 * n24 - n22 * n13 * n44 + n12 * n23 * n44) *
+              idet;
+  ret[0][3] = (n23 * n23 * n14 - n22 * n33 * n14 - n23 * n13 * n24 +
+               n12 * n33 * n24 + n22 * n13 * n34 - n12 * n23 * n34) *
+              idet;
+
+  ret[1][0] = ret[0][1];
+  ret[1][1] = (2.0 * n13 * n34 * n14 - n14 * n33 * n14 - n11 * n34 * n34 -
+               n13 * n13 * n44 + n11 * n33 * n44) *
+              idet;
+  ret[1][2] = (n14 * n23 * n14 - n12 * n34 * n14 - n14 * n13 * n24 +
+               n11 * n34 * n24 + n12 * n13 * n44 - n11 * n23 * n44) *
+              idet;
+  ret[1][3] = (n12 * n33 * n14 - n13 * n23 * n14 + n13 * n13 * n24 -
+               n11 * n33 * n24 - n12 * n13 * n34 + n11 * n23 * n34) *
+              idet;
+
+  ret[2][0] = ret[0][2];
+  ret[2][1] = ret[1][2];
+  ret[2][2] = (2.0 * n12 * n24 * n14 - n14 * n22 * n14 - n11 * n24 * n24 -
+               n12 * n12 * n44 + n11 * n22 * n44) *
+              idet;
+  ret[2][3] = (n13 * n22 * n14 - n12 * n23 * n14 - n13 * n12 * n24 +
+               n11 * n23 * n24 + n12 * n12 * n34 - n11 * n22 * n34) *
+              idet;
+
+  ret[3][0] = ret[0][3];
+  ret[3][1] = ret[1][3];
+  ret[3][2] = ret[2][3];
+  ret[3][3] = (2.0 * n12 * n23 * n13 - n13 * n22 * n13 - n11 * n23 * n23 -
+               n12 * n12 * n33 + n11 * n22 * n33) *
+              idet;
+
+  return ret;
+}
+
+// ----- Kerr metric G(q) in Kerr-Schild-like coordinates -----
+// Input: q = float4( q0, x, y, z ) where q.yzw = position float3
+float4x4 G_metric(float4 q) {
+  float3 p = q.yzw;
+  float rho = dot(p, p) - _a * _a;
+
+  // Compute r^2 and r
+  float r2 = 0.5 * (rho + sqrt(rho * rho + 4.0 * _a * _a * p.z * p.z));
+  float r = sqrt(max(r2, 1e-6)); // clamp to avoid zero or NaN
+
+  // Avoid division by zero in denominator for k components
+  float denom_k = max(r2 + _a * _a, 1e-6);
+
+  // k vector components
+  float4 k = float4(1.0, (r * p.x + _a * p.y) / denom_k,
+                    (r * p.y - _a * p.x) / denom_k, p.z / r);
+
+  // f scalar with epsilon on denominator
+  float denom_f = max(r2 * r2 + _a * _a * p.z * p.z, 1e-6);
+  float f = saturate(smoothstep(cdist * 0.5, 0.0, r)) * r2 *
+            (2.0 * _m * r - _Q * _Q) / denom_f;
+
+  // Outer products of k components
+  float4x4 kmat =
+      float4x4(k.x * k.x, k.x * k.y, k.x * k.z, k.x * k.w, k.y * k.x, k.y * k.y,
+               k.y * k.z, k.y * k.w, k.z * k.x, k.z * k.y, k.z * k.z, k.z * k.w,
+               k.w * k.x, k.w * k.y, k.w * k.z, k.w * k.w);
+
+  // Return f * kmat + diag(-1, 1, 1, 1)
+  return f * kmat + diag(float4(-1, 1, 1, 1));
+}
+
+// (g_uv * (g^uv * P_u)) * P_u
+float L(float4 qt, float4x4 g) { return dot(mul(g, qt), qt); }
+
+// Lagrangian L(qt,q) = dot(g*qt, qt)
+// qt => g_inv * p
+float L_func(float4 qt, float4 q) {
+  float4x4 g = G_metric(q);
+  // compute g*qt (matrix-vector)
+  return L(qt, g);
+}
+
+// Hamiltonian H = dot(ginv*p, p)
+float H_func(float4 p, float4 q) {
+  float4x4 g = G_metric(q);
+  float4x4 ginv = inverse_sym(g);
+  float4 tmp = mul(ginv, p);
+  return dot(tmp, p);
+}
+
+// Convert velocity vector v (3) at spatial point q to 4-momentum P =
+// 2*G*float4(1, v)
+float4 Vec2P(float3 v, float3 qpos) {
+  float4 q = float4(0.0, qpos);
+  float4x4 g = G_metric(q);
+  float4 base = float4(1.0, v.x, v.y, v.z);
+  float4 res = mul(g, base) * 2.0;
+  return res;
+}
+
+// P2Vec: convert momentum p -> velocity vec (g^-1 * p)
+float4 P2Vec(float4 p, float4 q) {
+  float4x4 g = G_metric(q);
+  float4x4 ginv = inverse_sym(g);
+  return mul(ginv, p);
+}
+
+// derivative of H (dH/dq and dH/dp) approximated numerically for dHdq
+void dH_func(float4 p, float4 q, out float4 dHdq, out float4 dHdp) {
+  float eps = 0.005;
+  float4x4 g = G_metric(q);
+  float4x4 ginv = inverse_sym(g);
+  // dHdp = 2 * ginv * p
+  float4 tmp = mul(ginv, p);
+  dHdp = tmp * 2.0;
+
+  // approximate dHdq using finite differences on H(p,q+eps*ex)
+  float4 qx = q + float4(eps, 0, 0, 0);
+  float4 qy = q + float4(0, eps, 0, 0);
+  float4 qz = q + float4(0, 0, eps, 0);
+  float4 qw = q + float4(0, 0, 0, eps);
+  float H0 = H_func(p, q);
+  float hx = H_func(p, qx);
+  float hy = H_func(p, qy);
+  float hz = H_func(p, qz);
+  float hw = H_func(p, qw);
+  dHdq = float4((hx - H0) / eps, (hy - H0) / eps, (hz - H0) / eps,
+                (hw - H0) / eps);
+}
+
+// one integration step (symplectic-like small step) - translated from dhstep+
+// hstep
+void hstep(inout float4 P, inout float4 Q, uint threadId) {
+  // variable internal dt (here small fixed-ish value)
+  // float dt = 0.03;
+  float dt1 = clamp(1.0 / length(P), 0.1, 4.0) * dt[threadId];
+
+  // compute ginv and L etc as in original
+  float4x4 g = G_metric(Q);
+  float4x4 ginv = inverse_sym(g);
+  float4 qt = mul(ginv, P);
+
+  // dHdq = -( L(qt, q+eps ex) ... ) / eps  (approx)
+  float L0 =
+      L_func(qt, Q); // L(qt, g) alternate in original... but we'll approximate
+  // compute L at shifted q for finite difference for each component
+  float Lx = L_func(qt, Q + float4(eps, 0, 0, 0));
+  float Ly = L_func(qt, Q + float4(0, eps, 0, 0));
+  float Lz = L_func(qt, Q + float4(0, 0, eps, 0));
+  float Lw = L_func(qt, Q + float4(0, 0, 0, eps));
+  float4 dHdq = -float4((Lx - L0) / eps, (Ly - L0) / eps, (Lz - L0) / eps,
+                        (Lw - L0) / eps);
+
+  // steps
+  float4 dP = -dHdq * dt1;
+  float4 dQ = mul(ginv, P) * (2.0 * dt1);
+
+  P += dP;
+  Q += dQ;
+}
+
+// variable timestep in space-time and stop condition
+bool variDT(float4 P, float4 q, uint threadId) {
+  // Kerr metric in Kerr-Schild coordinates
+  float3 p = q.yzw;
+  float rho = dot(p, p) - _a * _a;
+  float r2 = 0.5 * (rho + sqrt(rho * rho + 4.0 * _a * _a * p.z * p.z));
+  float r = sqrt(r2);
+  dt[threadId] = lerp(0.03, 10.0, pow(max(r - 1.0, 0.0) / cdist, 1.));
+  if (r < 1. && _a <= 1.0 || length(P) > 45.0)
+    return true;
+
+  if (length(q.yzw) > cdist)
+    return true;
+  return false;
+}
+
+// termination criterion similar to variDT
+bool variDT_check(float4 P, float4 q) {
+  float3 p = q.yzw;
+  float rho = dot3(p, p) - _a * _a;
+  float r2 = 0.5 * (rho + sqrt(rho * rho + 4.0 * _a * _a * p.z * p.z));
+  float r = sqrt(max(r2, 1e-8));
+  if ((r < 1.0 && _a <= 1.0) || length(q) > 45.0)
+    return true;
+  if (length(q.yzw) > cdist)
+    return true;
+  return false;
+}
+
+int classifyStep(float4 P, float4 q, uint threadId) {
+  float3 p = q.yzw;
+  float rho = dot(p, p) - _a * _a;
+  float r2 = 0.5 * (rho + sqrt(rho * rho + 4.0 * _a * _a * p.z * p.z));
+  float r = sqrt(r2);
+
+  dt[threadId] = lerp(0.005, 10.0, saturate((r - 0.5) / cdist));
+
+  // horizon: r_+ = 1 + sqrt(1 - a^2) in units of M = 1.
+  // Anything crossing r = 1 is doomed for any a < 1; use it with a small
+  // margin.
+  if (r < 1.0001 || length(P) > 25.0)
+    return 1; // captured -> black
+
+  if (length(p) > cdist)
+    return 2; // escaped -> sample sky
+
+  return 0;
+}
+
+float rFromCoords(float3 p) {
+  float rho = dot3(p, p) - _a * _a;
+  float r2 = 0.5 * (rho + sqrt(rho * rho + 4.0 * _a * _a * p.z * p.z));
+  return sqrt(r2);
+}
+
+float3 intersectPointXY(float3 a, float3 b) {
+  float t = -a.z / (b.z - a.z);
+  return float3(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y), 0.0);
+}
+
+// sphere intersection: returns nearest t or large value
+float sphIntersect(float3 ro, float3 rd, float4 sph) {
+  float3 oc = ro - sph.xyz;
+  float b = dot3(oc, rd);
+  float c = dot3(oc, oc) - sph.w * sph.w;
+  float h = b * b - c;
+  if (h < 0.0)
+    return 1e10;
+  return -b - sqrt(h);
+}
+
+// render a single pixel (fragCoord in pixel space)
+float4 RenderPixel(float2 fragCoord, uint threadId) {
+  float2 uv = (fragCoord + 0.5) / float2(_width, _height);
+  float3 ro = _CamPos;
+  float3 rd = calculateViewDir(uv);
+
+  float t0 = sphIntersect(ro, rd, float4(0, 0, 0, cdist));
+  if (t0 > 0.0 && t0 < 1e10)
+    ro += rd * t0;
+
+  float4 Q = float4(0.0, ro);
+  float4 P = normalize(Vec2P(rd, Q.yzw));
+
+  float3 col = 0.0;
+  float T = 1.0;
+  bool escaped = false;
+  bool hitDisc = false;
+
+  for (int i = 0; i < MAX_STEPS; ++i) {
+    float4 lastQ = Q;
+    hstep(P, Q, threadId);
+
+    if (lastQ.w * Q.w < 0.0) {
+      float3 hit = intersectPointXY(lastQ.yzw, Q.yzw);
+      float r = rFromCoords(hit);
+
+      if (r > _r_isco && r < _disk_max_radius) {
+        // redshift
+        float E = -P.x;
+        float Lz = hit.x * P.z - hit.y * P.y; // x * P.y - y * P.x
+        float lambda = Lz / max(E, 1e-8);
+
+        float om = 1.0 / (r * sqrt(r) + _a);
+        float ut = (1.0 + _a / (r * sqrt(r))) /
+                   sqrt(max(1.0 - 3.0 / r + 2.0 * _a / (r * sqrt(r)), 1e-4));
+        float g = clamp(1.0 / (ut * (1.0 - om * lambda)), 0.05, 20.0);
+
+        float F = max(ptFlux(r) / _peak_flux, 0.0); // peak = 1
+        // float phi = atan2(hit.y, hit.x) * 0.5 + 2.0 * PI;
+        float turb = diskTurbulence2(r, hit.xy, _Time);
+        float turbEnvelope = smoothstep(_r_isco, 3.0, r) *
+                             (1.0 - smoothstep(10.0, _disk_max_radius, r));
+        float turbStr = _turbulenceStrength * turbEnvelope;
+
+        float turbulenceFactor = 1.0 + turbStr * (turb - 0.5) * 2.0;
+
+        float T_emit = _Tpeak * pow(F, 0.25);
+        float T_obs = T_emit * g;
+        float3 colour = blackbodyChroma(T_obs);
+        float intensity = F * pow(g, 4.0);
+
+        float outerFade =
+            1.0 - smoothstep(_disk_max_radius * 0.85, _disk_max_radius, r);
+        float3 emission =
+            colour * intensity * turbulenceFactor * outerFade * 100.0;
+        float tau = 2.0 * outerFade;
+
+        float alpha = 1.0 - exp(-tau);
+        col += T * alpha * emission;
+
+        /* if ((1.0 - om * lambda) < 0.0)
+          col = float3(0, 0, 0);
+        else
+          col = float3(1, 0, 1);
+ */
+        T *= 1.0 - alpha;
+        if (T < 0.01)
+          break;
+      }
+    }
+
+    int state = classifyStep(P, Q, threadId);
+    if (state == 1)
+      break; // captured: sky stays 0, disk col already banked
+    if (state == 2 || hitDisc) {
+      escaped = true;
+      break;
+    }
+  }
+
+  float3 sky = 0.0;
+  if (escaped) {
+    sky = SampleSky(normalize(P2Vec(P, Q).yzw)).rgb;
+    float r_cam = length(_CamPos);
+
+    // For a stationary camera, g is purely gravitational blueshift.
+    // As r_cam gets closer to the horizon (r=2), g increases.
+    float g_sky = 1.0 / sqrt(max(1.0 - 2.0 / r_cam, 1e-4));
+
+    // 2. Bolometric Intensity Shift (gets exponentially brighter or dimmer)
+    float intensity = pow(g_sky, 4.0);
+
+    // 3. Chromatic Shift
+    // We can't perfectly redshift an RGB texture, but we can fake it by
+    // assuming the HDRI represents stars with an average temperature of ~6000K.
+    // We use your existing function to calculate a color tint!
+    float3 baseChroma = max(blackbodyChroma(6000.0), 1e-5);
+    float3 shiftChroma = blackbodyChroma(6000.0 * g_sky);
+
+    // Apply the chromatic tint and the intensity scale
+    sky = sky * (shiftChroma / baseChroma) * intensity;
+  }
+
+  return float4(col + T * sky, 1.0);
+}
+// return float4(fcol * !hitDisc + hitDisc * float3(1.0, 0.74, 0.18), 1.0);
+
+// Actual kernel entry that writes to Result
+[numthreads(8, 8, 1)] void CSMainKernel(uint3 id : SV_DispatchThreadID,
+                                        uint gid : SV_GroupIndex) {
+  uint x = id.x;
+  uint y = id.y;
+  if (x >= _width || y >= _height)
+    return;
+
+  dt[gid] = 0.03; // initial dt value
+
+  float2 frag = float2(x, y);
+  float4 col = RenderPixel(frag, gid);
+  float2 uv = (id.xy + 0.5f) / float2(_width, _height);
+  _Result[int2(x, y)] = col;
+}
